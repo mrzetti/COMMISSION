@@ -120,11 +120,6 @@ constexpr auto continentalness_large_config = make_normal_noise_config(continent
 constexpr auto chosen_continentalness_config = large_biomes ? continentalness_large_config : continentalness_config;
 __device__ constexpr auto device_chosen_continentalness_config = chosen_continentalness_config;
 
-// switch - 4.745 Gsps
-// int8_t[3][16] - 5.293 Gsps
-// float[3][16] - 5.324 Gsps
-// uint32_t[16] - 5.306 Gsps
-
 struct GradDotTable {
   float x[16];
   float y[16];
@@ -350,9 +345,6 @@ __device__ inline void XrsrRandom_double_fork(XrsrRandom &rng, XrsrRandomFork &f
 
 namespace KernelFilterSeeds {
 constexpr uint32_t threads_per_block = 256;
-// constexpr uint32_t threads_per_run = UINT64_C(1) << 10;
-// constexpr uint32_t threads_per_run = UINT64_C(1) << 22;
-// constexpr uint32_t threads_per_run = UINT64_C(1) << 25;
 constexpr uint32_t threads_per_run = UINT64_C(1) << 28; //28
 
 __device__ XrsrRandomFork noise_yo_fork(XrsrRandomFork noise_fork) {
@@ -636,8 +628,6 @@ void init_conv_kernels() {
 namespace KernelFilterGradVecs1 {
 constexpr uint32_t block_dim_x = 256;
 
-// __managed__ float scores[256][256];
-
 __global__
 __launch_bounds__(block_dim_x) void kernel(InputBuffer<uint64_t> seeds, OutputBuffer<SeedPos> outputs, KernelSeed1::Result *results) {
   __shared__ alignas(16) ImprovedNoise oct_0A;
@@ -661,8 +651,6 @@ __launch_bounds__(block_dim_x) void kernel(InputBuffer<uint64_t> seeds, OutputBu
 
     {
       int32_t nz = threadIdx.x;
-
-      // hoist
       uint32_t p_z[6];
 #pragma unroll
       for (int32_t dnz = 0; dnz < 6; dnz++) {
@@ -696,7 +684,6 @@ __launch_bounds__(block_dim_x) void kernel(InputBuffer<uint64_t> seeds, OutputBu
     idx_xy[0][threadIdx.x] = v0;
     idx_xy[1][threadIdx.x] = v1;
     
-    // hoist
     if (threadIdx.x < 6) {
         idx_xy[0][256 + threadIdx.x] = v0;
         idx_xy[1][256 + threadIdx.x] = v1;
@@ -705,8 +692,9 @@ __launch_bounds__(block_dim_x) void kernel(InputBuffer<uint64_t> seeds, OutputBu
 
     int32_t nz = threadIdx.x;
 
-    int32_t w0[6];
-    int32_t w1[6];
+    // Expand window size to 10 to support unroll factor of 4
+    int32_t w0[10];
+    int32_t w1[10];
 #pragma unroll
     for (int32_t j = 0; j < 6; j++) {
       w0[j] = idx_xy[0][j];
@@ -716,43 +704,79 @@ __launch_bounds__(block_dim_x) void kernel(InputBuffer<uint64_t> seeds, OutputBu
     int32_t x = x_center;
     int32_t z = z_center + nz * cell_size;
 
-    for (int32_t nx = 0; nx < 256; nx++) {
-      float conv = 0;
-#pragma unroll
-      for (int32_t dnx = 0; dnx < 6; dnx++){
-        conv += conv_z[0][dnx][w0[dnx] + nz];
-      }
-#pragma unroll
-      for (int32_t dnx = 0; dnx < 6; dnx++){
-        conv += conv_z[1][dnx][w1[dnx] + nz];
-      }
+    // Process 256 elements in chunks of 4
+    for (int32_t nx = 0; nx < 256; nx += 4) {
+      // Stage next 4 indices from shared memory into registers
+      w0[6] = idx_xy[0][nx + 6]; w1[6] = idx_xy[1][nx + 6];
+      w0[7] = idx_xy[0][nx + 7]; w1[7] = idx_xy[1][nx + 7];
+      w0[8] = idx_xy[0][nx + 8]; w1[8] = idx_xy[1][nx + 8];
+      w0[9] = idx_xy[0][nx + 9]; w1[9] = idx_xy[1][nx + 9];
 
-      if (conv >= -18.5) { // 19
-        uint32_t result_index = atomicAdd(outputs.len, 1);
-        if (result_index < outputs.max_len){
-          outputs.data[result_index] = {seed_index, x, z};
+      // Sub-iteration 0
+      {
+        float conv = 0;
+#pragma unroll
+        for (int32_t dnx = 0; dnx < 6; dnx++) conv += conv_z[0][dnx][w0[dnx] + nz];
+#pragma unroll
+        for (int32_t dnx = 0; dnx < 6; dnx++) conv += conv_z[1][dnx][w1[dnx] + nz];
+
+        if (conv >= -18.5f) {
+          uint32_t result_index = atomicAdd(outputs.len, 1);
+          if (result_index < outputs.max_len) outputs.data[result_index] = {seed_index, x, z};
         }
+        x += cell_size;
       }
-      // if (seeds.data[seed_index] == 123) {
-      //     scores[nx][nz] = conv;
-      // }
-      // if (blockIdx.x == 42) {
-      //     printf("GV %" PRIi64 " %i %i %.3f\n", seeds.data[seed_index], nx,
-      //     nz, conv);
-      // }
 
-      // addition brrr
-      x += cell_size;
-
-      if (nx < 255) {
+      // Sub-iteration 1
+      {
+        float conv = 0;
 #pragma unroll
-        for (int32_t j = 0; j < 5; j++) {
-          w0[j] = w0[j + 1];
-          w1[j] = w1[j + 1];
+        for (int32_t dnx = 0; dnx < 6; dnx++) conv += conv_z[0][dnx][w0[dnx + 1] + nz];
+#pragma unroll
+        for (int32_t dnx = 0; dnx < 6; dnx++) conv += conv_z[1][dnx][w1[dnx + 1] + nz];
+
+        if (conv >= -18.5f) {
+          uint32_t result_index = atomicAdd(outputs.len, 1);
+          if (result_index < outputs.max_len) outputs.data[result_index] = {seed_index, x, z};
         }
-        int32_t m = nx + 6; 
-        w0[5] = idx_xy[0][m];
-        w1[5] = idx_xy[1][m];
+        x += cell_size;
+      }
+
+      // Sub-iteration 2
+      {
+        float conv = 0;
+#pragma unroll
+        for (int32_t dnx = 0; dnx < 6; dnx++) conv += conv_z[0][dnx][w0[dnx + 2] + nz];
+#pragma unroll
+        for (int32_t dnx = 0; dnx < 6; dnx++) conv += conv_z[1][dnx][w1[dnx + 2] + nz];
+
+        if (conv >= -18.5f) {
+          uint32_t result_index = atomicAdd(outputs.len, 1);
+          if (result_index < outputs.max_len) outputs.data[result_index] = {seed_index, x, z};
+        }
+        x += cell_size;
+      }
+
+      // Sub-iteration 3
+      {
+        float conv = 0;
+#pragma unroll
+        for (int32_t dnx = 0; dnx < 6; dnx++) conv += conv_z[0][dnx][w0[dnx + 3] + nz];
+#pragma unroll
+        for (int32_t dnx = 0; dnx < 6; dnx++) conv += conv_z[1][dnx][w1[dnx + 3] + nz];
+
+        if (conv >= -18.5f) {
+          uint32_t result_index = atomicAdd(outputs.len, 1);
+          if (result_index < outputs.max_len) outputs.data[result_index] = {seed_index, x, z};
+        }
+        x += cell_size;
+      }
+
+      // Shift registers by 4 only once per 4 loop iterations
+#pragma unroll
+      for (int32_t j = 0; j < 6; j++) {
+        w0[j] = w0[j + 4];
+        w1[j] = w1[j + 4];
       }
     }
   }
@@ -773,14 +797,13 @@ __global__
 __launch_bounds__(block_dim_x) void kernel(InputBuffer<SeedPos> inputs, OutputBuffer<SeedPos> outputs, KernelSeed1::Result *results) {
   __shared__ alignas(16) ImprovedNoise oct_0B;
   __shared__ float shared_kernel_0B[2][6][6][16];
+  __shared__ float conv_z[2][6][512];
 
   for (uint32_t i = threadIdx.x; i < sizeof(shared_kernel_0B) / sizeof(uint32_t); i += block_dim_x) {
     reinterpret_cast<uint32_t *>(&shared_kernel_0B)[i] = reinterpret_cast<uint32_t *>(device_kernel_0B)[i];
   }
 
   constexpr int32_t cell_size_0A = (int32_t)(1 / chosen_continentalness_config.octaves_a[0].input_factor) * 256;
-
-  static_assert(cell_size_0A * grid_width * 4 < 700E6);
 
   uint32_t inputs_len = *inputs.len;
   for (uint32_t input_index = blockIdx.x; input_index < inputs_len; input_index += gridDim.x) {
@@ -791,38 +814,65 @@ __launch_bounds__(block_dim_x) void kernel(InputBuffer<SeedPos> inputs, OutputBu
       reinterpret_cast<uint4 *>(&oct_0B)[threadIdx.x] = reinterpret_cast<const uint4 *>(&results[input.seed_index].continentalness_0B)[threadIdx.x];
     }
     __syncthreads();
-    for (uint32_t pos_index = threadIdx.x; pos_index < threads_per_seed; pos_index += blockDim.x) {
+    for (int32_t V = threadIdx.x; V < 256; V += blockDim.x) {
+      uint32_t p_z[6];
+#pragma unroll
+      for (int32_t dnz = 0; dnz < 6; dnz++) {
+        p_z[dnz] = oct_0B.p[(V + dnz) & 0xFF] & 0xF;
+      }
+#pragma unroll
+      for (int32_t dny = 0; dny < 2; dny++) {
+#pragma unroll
+        for (int32_t dnx = 0; dnx < 6; dnx++) {
+          float conv = 0;
+#pragma unroll
+          for (int32_t dnz = 0; dnz < 6; dnz++) {
+            conv += shared_kernel_0B[dny][dnx][dnz][p_z[dnz]];
+          }
+          conv_z[dny][dnx][V] = conv;
+          conv_z[dny][dnx][V + 256] = conv;
+        }
+      }
+    }
+    __syncthreads();
 
-      int32_t tile_dx = (pos_index % grid_width - grid_half) * cell_size_0A;
-      int32_t tile_dz = (pos_index / grid_width - grid_half) * cell_size_0A;
-
+    int32_t ny = oct_0B.yo;
+    for (uint32_t tx = 0; tx < grid_width; tx++) {
+      int32_t tile_dx = (tx - grid_half) * cell_size_0A;
       int32_t x = input.x + tile_dx;
-      int32_t z = input.z + tile_dz;
-
       int32_t nx = __float2int_rd(x * (float)chosen_continentalness_config.octaves_b[0].input_factor + oct_0B.xo - 2.0f);
-      int32_t ny = __float2int_rd(oct_0B.yo);
-      int32_t nz = __float2int_rd(z * (float)chosen_continentalness_config.octaves_b[0].input_factor + oct_0B.zo - 2.0f);
-
-      float conv = 0;
+      int32_t hoisted_idx_xy[2][6];
 #pragma unroll
       for (int32_t dnx = 0; dnx < 6; dnx++) {
         int32_t idx_x = oct_0B.p[(nx + dnx) & 0xFF];
 #pragma unroll
         for (int32_t dny = 0; dny < 2; dny++) {
-          int32_t idx_xy = oct_0B.p[(idx_x + ny + dny) & 0xFF];
-#pragma unroll
-          for (int32_t dnz = 0; dnz < 6; dnz++) {
-            int32_t idx_xyz = oct_0B.p[(idx_xy + nz + dnz) & 0xFF];
-            conv += shared_kernel_0B[dny][dnx][dnz][idx_xyz & 0xF];
-          }
+          hoisted_idx_xy[dny][dnx] = oct_0B.p[(idx_x + ny + dny) & 0xFF];
         }
       }
+      for (uint32_t tz = threadIdx.x; tz < grid_width; tz += blockDim.x) {
+        int32_t tile_dz = (tz - grid_half) * cell_size_0A;
+        int32_t z = input.z + tile_dz;
 
-      if (conv > -19.5) {
-        uint32_t result_index = atomicAdd(outputs.len, 1);
-        if (result_index >= outputs.max_len)
-          continue;
-        outputs.data[result_index] = {input.seed_index, x, z};
+        int32_t nz = __float2int_rd(z * (float)chosen_continentalness_config.octaves_b[0].input_factor + oct_0B.zo - 2.0f);
+        int32_t nz_masked = nz & 0xFF;
+
+        float conv = 0;
+#pragma unroll
+        for (int32_t dnx = 0; dnx < 6; dnx++) {
+          conv += conv_z[0][dnx][hoisted_idx_xy[0][dnx] + nz_masked];
+        }
+#pragma unroll
+        for (int32_t dnx = 0; dnx < 6; dnx++) {
+          conv += conv_z[1][dnx][hoisted_idx_xy[1][dnx] + nz_masked];
+        }
+
+        if (conv > -19.5f) {
+          uint32_t result_index = atomicAdd(outputs.len, 1);
+          if (result_index < outputs.max_len) {
+            outputs.data[result_index] = {input.seed_index, x, z};
+          }
+        }
       }
     }
   }
@@ -869,9 +919,6 @@ __global__ __launch_bounds__(threads_per_block) void kernel(InputBuffer<uint64_t
 
     if (val >= -0.515f)
       continue; // 1 in 27.7
-    // if (val >= -0.7f) continue; // 1 in 176
-    // if (val >= -0.8f) continue;
-    // if (val >= -1.48f) continue;
 
     uint32_t result_index = atomicAdd(outputs.len, 1);
     if (result_index >= outputs.max_len){
@@ -1360,13 +1407,6 @@ void GpuThread::run() {
   OutputBuffer<SeedPos> outputs_filter_gradvecs_2(buffer_2, &device_buffer_lens->results_len_filter_gradvecs_2);
   auto &stage_filter_gradvecs_2 = stage_stats.emplace_back("filter_gradvecs_2", stage_filter_2_0a.outputs_len, &host_buffer_lens.results_len_filter_gradvecs_2, KernelFilterGradVecs2::threads_per_seed, outputs_filter_gradvecs_2.max_len);
 
-  // namespace Filter1 = KernelFilter1;
-  // OutputBuffer<SeedPos> outputs_filter_1(buffer_1,
-  // device_buffer_lens->results_len_filter_1); auto &stage_filter_1 =
-  // stage_stats.emplace_back("filter_1", stage_filter_seeds.outputs_len,
-  // &host_buffer_lens.results_len_filter_1, KernelFilter1::threads_per_seed,
-  // outputs_filter_1.max_len);
-
   using Kernel2RunFunc = void (*)(InputBuffer<SeedPos> inputs, OutputBuffer<SeedPos> outputs, KernelSeed1::Result *results, cudaStream_t stream);
   struct Filter2Stage {
     Kernel2RunFunc run;
@@ -1380,12 +1420,6 @@ void GpuThread::run() {
   Kernel2RunFunc filter_2_0A_run = KernelFilter2_0A::run;
 
   Kernel2RunFunc filter_2_runs[] = {
-      // KernelFilter2::Template<-7400, 2, 6 * 1024, 32, 3, false, true>::run,
-      // // 6m | P(X < x) = 0.0973
-      // KernelFilter2::Template<-7400, 2, 6 * 1024, 128, 11, true, true>::run,
-      // // 6m | P(X < x) = <0.01
-      // KernelFilter2::Template<-7400, 2, 6 * 1024, 512, 63, false, true>::run,
-      // // 6m | P(X < x) = <0.01
       KernelFilter2::Template<-10500, 12, 8 * 1024, 256, 23, false, true, false>::run, 
       KernelFilter2::Template<-10500, 14, 8 * 1024, 1024, 110, false, true, false>::run, 
       KernelFilter2::Template<-10500, 18, 10 * 1024, 16384, 1440, false, false, false>::run, // zajonc was here :D, use 1560 instead of 1440 because of colab shitty cpus
@@ -1405,13 +1439,7 @@ void GpuThread::run() {
     }
   }
 
-  int print_interval = 4096;
-
-  // for (int32_t nx = 0; nx < 256; nx++) {
-  //     for (int32_t nz = 0; nz < 256; nz++) {
-  //         KernelFilterGradVecs1::scores[nx][nz] = -123;
-  //     }
-  // }
+  int print_interval = 256;
 
   auto start = std::chrono::steady_clock::now();
 
@@ -1490,11 +1518,6 @@ void GpuThread::run() {
           // result.z);
           outputs.queue.push({seed, result.x * 4, result.z * 4});
         }
-        // auto lock_end = std::chrono::steady_clock::now();
-        // double lock_time =
-        // std::chrono::duration_cast<std::chrono::nanoseconds>(lock_end -
-        // lock_start).count() * 1e-9; std::printf("Lock took %.3f s\n",
-        // lock_time);
       }
     }
 
@@ -1544,17 +1567,6 @@ void GpuThread::run() {
       }
       start = end;
     }
-
-    // FILE *scores_file = std::fopen("scores.txt", "w");
-    // if (!scores_file) std::abort();
-    // std::fprintf(scores_file, "123");
-    // for (int32_t nx = 0; nx < 256; nx++) {
-    //     for (int32_t nz = 0; nz < 256; nz++) {
-    //         std::fprintf(scores_file, " %.6f",
-    //         KernelFilterGradVecs1::scores[nx][nz]);
-    //     }
-    // }
-    // std::fclose(scores_file);
   }
 
   TRY_CUDA(cudaStreamDestroy(stream));
