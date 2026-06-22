@@ -26,7 +26,7 @@ jobs:
           make LARGE_BIOMES=${{ matrix.biomes }} ARCH=sm_89 CC=gcc-11 CXX=g++-11
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ github.event.repository.name }}.${{ github.ref_name }}.${{ github.run_id }}.linux_x86.biomes${{ matrix.biomes }}
+          name: ${{ github.event.repository.name }}.${{ github.run_id }}.linux_x86.biomes${{ matrix.biomes }}
           path: ./main
   
   windows_cuda:
@@ -82,5 +82,5 @@ jobs:
           make LARGE_BIOMES=${{ matrix.biomes }} ARCH=sm_89
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ github.event.repository.name }}.${{ github.ref_name }}.${{ github.run_id }}.windows_x86.biomes${{ matrix.biomes }}
+          name: ${{ github.event.repository.name }}.${{ github.run_id }}.windows_x86.biomes${{ matrix.biomes }}
           path: ./main.exe
